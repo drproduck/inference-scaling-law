@@ -288,10 +288,15 @@ class BetaBinomialPassAtK:
     def predict(self, k_values, method="integrated", bias_correct=False):
         """
         Predict pass@k for given k values.
+
+        For ``method="integrated"``, returns the pass@k curve under the fitted
+        global Beta prior (one value per k). For ``plugin`` and ``posterior``,
+        returns the mean of per-problem values over the dataset. After the call,
+        ``self._psi`` holds per-k values for ``integrated``, or shape
+        ``(n_problems, len(k))`` for ``plugin`` / ``posterior``.
         """
         self._check_fitted()
         k_values = np.asarray(k_values, dtype=float)
-        n = int(np.sum(self.attempts_))  
 
         if method == "integrated":
             # Target parameter H(alpha, beta): Expected probability of k failures
@@ -331,7 +336,7 @@ class BetaBinomialPassAtK:
                 # Apply correction and clip to valid probability bounds
                 psi_int = np.clip(psi_int - bias, 0.0, 1.0)
 
-            return 1.0 - psi_int
+            self._psi = 1.0 - psi_int
 
         elif method == "plugin":
             eb_ests = (self.alpha_ + self.successes_) / (self.alpha_ + self.beta_ + self.attempts_)
@@ -341,8 +346,8 @@ class BetaBinomialPassAtK:
             #     correction = (k_values * (k_values - 1) / (2 * n)) * p_mean * (1.0 - p_mean) ** (k_values - 1)
             #     psi_bc = np.clip(psi_plugin - correction, 0.0, 1.0) 
             #     return 1.0 - psi_bc
-                
-            return 1.0 - psi_plugin.mean(axis=0)
+
+            self._psi = 1.0 - psi_plugin
 
         elif method == "posterior":
             # 1. Compute posterior Beta parameters for each problem
@@ -358,11 +363,25 @@ class BetaBinomialPassAtK:
             # E[(1-theta)^k] = B(alpha, beta + k) / B(alpha, beta)
             log_prob_fail = betaln(pa, pb + k_val) - betaln(pa, pb)
             psi_posterior = np.exp(log_prob_fail)
-            
-            # 4. Average over all problems in the benchmark
-            return 1.0 - psi_posterior.mean(axis=0)
-            
-        raise ValueError(f"method must be 'integrated' or 'plugin' or 'posterior', got {method!r}")
+
+            self._psi = 1.0 - psi_posterior
+
+        else:
+            raise ValueError(
+                f"method must be 'integrated' or 'plugin' or 'posterior', got {method!r}"
+            )
+
+        # plugin/posterior: (n_problems, len_k) — average over problems.
+        # integrated: (len_k,) — already the marginal under Beta(alpha_, beta_).
+        if self._psi.ndim == 2:
+            out = self._psi.mean(axis=0)
+        else:
+            out = self._psi
+
+        out = np.asarray(out)
+        if out.size == 1:
+            return float(out.ravel()[0])
+        return out
 
     def _check_fitted(self):
         if not hasattr(self, "alpha_"):
@@ -401,23 +420,41 @@ class NPMLEBinomialPassAtK:
     reg_alpha : float, default=0.0
         Dirichlet regularization strength (pseudo-counts). Values > 0 pull the 
         weights away from absolute sparsity, acting similarly to maximum entropy.
+    include_empirical_support : bool, default=True
+        If True (default), unique non-zero sample proportions are unioned into the
+        grid so observed ``p_hat`` lie on the support. If False, the support is
+        only the fixed cubed-spaced baseline of length ``m_grid`` (plus the
+        ``epsilon`` floor), so ``len(w_)`` is the same on every ``fit`` call.
 
     Attributes
     ----------
-    t_ : ndarray of shape (m_grid,)
+    t_ : ndarray of shape (n_support_,)
         The discrete grid points representing possible success rates.
-    w_ : ndarray of shape (m_grid,)
+    w_ : ndarray of shape (n_support_,)
         The estimated probability mass (weights) assigned to each grid point.
+    posterior_weights_ : ndarray of shape (n_problems, n_support_)
+        Posterior probability of each grid point given each problem's counts.
+    n_support_ : int
+        Number of support points ``len(t_)`` after the last ``fit``.
     n_problems_in_ : int
         Number of problems seen during fit.
     """
 
-    def __init__(self, m_grid=300, max_iter=5000, tol=1e-6, verbose=True, reg_alpha=0.0):
+    def __init__(
+        self,
+        m_grid=300,
+        max_iter=5000,
+        tol=1e-6,
+        verbose=True,
+        reg_alpha=0.0,
+        include_empirical_support=True,
+    ):
         self.m_grid = m_grid
         self.max_iter = max_iter
         self.tol = tol
         self.verbose = verbose
         self.reg_alpha = reg_alpha
+        self.include_empirical_support = include_empirical_support
 
 
     def fit(self, successes, attempts):
@@ -430,16 +467,17 @@ class NPMLEBinomialPassAtK:
         # 1.2 The Information Limit Bound
         epsilon = 1.0 / np.sum(attempts)
         
-        # 2. Grid Construction
-        base = np.linspace(0, 1, self.m_grid) ** 3
+        # 2. Grid Construction (baseline resolution fixed by constructor m_grid)
+        base = np.linspace(0, 1, int(self.m_grid)) ** 3
         self.t_ = epsilon + base * (1.0 - epsilon)
-        
-        with np.errstate(divide="ignore", invalid="ignore"):
-            p_hat = np.where(attempts > 0, successes / attempts, 0.0)
-        empirical_grid = np.unique(p_hat[p_hat > 0])
-        
-        self.t_ = np.unique(np.concatenate([self.t_, empirical_grid]))
-        self.m_grid = len(self.t_)
+
+        if self.include_empirical_support:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                p_hat = np.where(attempts > 0, successes / attempts, 0.0)
+            empirical_grid = np.unique(p_hat[p_hat > 0])
+            self.t_ = np.unique(np.concatenate([self.t_, empirical_grid]))
+
+        self.n_support_ = len(self.t_)
 
         # 3. Construct the Likelihood Kernel Manually (Log-Space)
         t_safe = np.clip(self.t_, 1e-10, 1.0 - 1e-10)
@@ -454,7 +492,8 @@ class NPMLEBinomialPassAtK:
         L = np.clip(L, 1e-15, None)
 
         # 4. Expectation-Maximization Loop
-        w = np.ones(self.m_grid) / self.m_grid
+        n_sup = self.n_support_
+        w = np.ones(n_sup) / n_sup
         for it in range(self.max_iter):
             joint = L * w[None, :]
             
@@ -480,41 +519,78 @@ class NPMLEBinomialPassAtK:
         
         final_joint = L * self.w_[None, :]
         final_P = final_joint / (final_joint.sum(axis=1, keepdims=True) + 1e-20)
-        
+        self.posterior_weights_ = final_P
+
         self.posterior_means_ = np.sum(self.t_[None, :] * final_P, axis=1)
         return self
 
     def predict(self, k_values, method="integrated", bias_correct=False):
         """
         Predict pass@k for given k values.
+
+        After this call, ``self._psi`` holds per-problem pass@k with shape
+        ``(n_problems_in_, len(k_values))``. For ``method="integrated"`` every
+        row equals the population marginal under ``w_``; for ``"posterior"``
+        and ``"plugin"`` rows generally differ.
+
+        Parameters
+        ----------
+        k_values : array-like
+        method : {"integrated", "posterior", "plugin"}, default="integrated"
+            ``integrated`` — expectation of pass@k under the global NPMLE mixture.
+            ``posterior`` — for each problem, expectation under that problem's
+            posterior on the grid; return value averages over problems (and
+            matches ``integrated`` at the unregularized NPMLE fixed point).
+            ``plugin`` — uses ``posterior_means_`` as in previous versions.
+        bias_correct : bool, default=False
+            Only used when ``method="plugin"``.
         """
         self._check_fitted()
         k_values = np.atleast_1d(k_values).astype(float)
+        n_p = self.n_problems_in_
+
+        t_row = np.clip(self.t_[None, :], 1e-10, 1.0 - 1e-10)  # (1, m_grid)
+        k_matrix = k_values[:, None]  # (len_k, 1)
+        one_minus_t_pow = (1.0 - t_row) ** k_matrix  # (len_k, m_grid)
 
         if method == "integrated":
-            t_matrix = self.t_[None, :]       # Shape: (1, m_grid)
-            k_matrix = k_values[:, None]      # Shape: (len(k), 1)
-
-            expected_failures = np.sum(self.w_ * ((1.0 - t_matrix) ** k_matrix), axis=1)
+            expected_failures = np.sum(self.w_ * one_minus_t_pow, axis=1)
             pass_at_k = 1.0 - expected_failures
+            self._psi = np.broadcast_to(pass_at_k, (n_p, len(k_values))).copy()
+
+        elif method == "posterior":
+            # E[(1-theta)^k | data_i] = sum_j P_ij (1-t_j)^k
+            expected_fail_per_problem = self.posterior_weights_ @ one_minus_t_pow.T
+            pass_at_k = 1.0 - np.mean(expected_fail_per_problem, axis=0)
+            self._psi = (1.0 - expected_fail_per_problem)
 
         elif method == "plugin":
-            theta_hat = self.posterior_means_[None, :] # Shape: (1, n_problems)
-            k_matrix = k_values[:, None]               # Shape: (len(k), 1)
-            
-            expected_failures = (1.0 - theta_hat) ** k_matrix # Shape: (len(k), n_problems)
+            theta_hat = self.posterior_means_[None, :]  # (1, n_problems)
+
+            expected_failures = (1.0 - theta_hat) ** k_matrix  # (len_k, n_problems)
 
             if bias_correct:
-                empirical_means = self.successes_ / self.attempts_ # Shape: (n_problems,)
+                empirical_means = self.successes_ / self.attempts_
                 correction = (
                     k_matrix
                     * (1.0 - theta_hat) ** (k_matrix - 1.0)
                     * (empirical_means[None, :] - theta_hat)
                 )
-                pass_at_k = np.clip(1.0 - np.mean(expected_failures - correction, axis=1), 0.0, 1.0)
+                pass_at_k = np.clip(
+                    1.0 - np.mean(expected_failures - correction, axis=1), 0.0, 1.0
+                )
+                self._psi = np.clip(
+                    1.0 - (expected_failures - correction), 0.0, 1.0
+                ).T
             else:
                 pass_at_k = 1.0 - np.mean(expected_failures, axis=1)
-        
+                self._psi = (1.0 - expected_failures).T
+
+        else:
+            raise ValueError(
+                f"method must be 'integrated', 'posterior', or 'plugin', got {method!r}"
+            )
+
         if pass_at_k.size == 1:
             return float(pass_at_k[0])
         return pass_at_k
@@ -525,16 +601,24 @@ class NPMLEBinomialPassAtK:
 
     def get_params(self, deep=True):
         return {
-            "m_grid": self.m_grid, 
-            "max_iter": self.max_iter, 
-            "tol": self.tol, 
+            "m_grid": self.m_grid,
+            "max_iter": self.max_iter,
+            "tol": self.tol,
             "verbose": self.verbose,
-            "reg_alpha": self.reg_alpha
+            "reg_alpha": self.reg_alpha,
+            "include_empirical_support": self.include_empirical_support,
         }
 
     def set_params(self, **params):
         for k, v in params.items():
-            if k not in ("m_grid", "max_iter", "tol", "verbose", "reg_alpha"):
+            if k not in (
+                "m_grid",
+                "max_iter",
+                "tol",
+                "verbose",
+                "reg_alpha",
+                "include_empirical_support",
+            ):
                 raise ValueError(f"Invalid parameter {k}")
             setattr(self, k, v)
         return self
