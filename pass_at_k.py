@@ -305,37 +305,6 @@ class BetaBinomialPassAtK:
 
             psi_int = _prob_fail(self.alpha_, self.beta_)
             
-            if bias_correct and hasattr(self, 'cov_'):
-                # Numerical Hessian calculation via central differences
-                h = 1e-4
-                a, b = self.alpha_, self.beta_
-                
-                f_0 = psi_int
-                f_a_plus = _prob_fail(a + h, b)
-                f_a_minus = _prob_fail(a - h, b)
-                f_b_plus = _prob_fail(a, b + h)
-                f_b_minus = _prob_fail(a, b - h)
-                
-                f_ap_bp = _prob_fail(a + h, b + h)
-                f_ap_bm = _prob_fail(a + h, b - h)
-                f_am_bp = _prob_fail(a - h, b + h)
-                f_am_bm = _prob_fail(a - h, b - h)
-                
-                # Second derivatives
-                H_aa = (f_a_plus - 2 * f_0 + f_a_minus) / (h ** 2)
-                H_bb = (f_b_plus - 2 * f_0 + f_b_minus) / (h ** 2)
-                H_ab = (f_ap_bp - f_ap_bm - f_am_bp + f_am_bm) / (4 * h ** 2)
-                
-                # Trace(Hessian @ Cov)
-                # Since cov_ is symmetric, cov_[0,1] == cov_[1,0]
-                cov_aa, cov_ab = self.cov_[0, 0], self.cov_[0, 1]
-                cov_bb = self.cov_[1, 1]
-                
-                bias = 0.5 * (H_aa * cov_aa + 2 * H_ab * cov_ab + H_bb * cov_bb)
-                
-                # Apply correction and clip to valid probability bounds
-                psi_int = np.clip(psi_int - bias, 0.0, 1.0)
-
             self._psi = 1.0 - psi_int
 
         elif method == "plugin":
@@ -382,6 +351,34 @@ class BetaBinomialPassAtK:
         if out.size == 1:
             return float(out.ravel()[0])
         return out
+
+    def predict_posterior(self, k_values, successes, attempts):
+        """
+        given test (successes, attempts), infer the latent variables, then compute pass@k
+        """
+        successes = np.asarray(successes, dtype=float)
+        attempts = np.asarray(attempts, dtype=float)
+        if len(successes) != len(attempts):
+            raise ValueError("successes and attempts must have the same length")
+        k_values = np.asarray(k_values, dtype=float)
+        # 1. Compute posterior Beta parameters for each problem
+        post_alpha = self.alpha_ + successes
+        post_beta = self.beta_ + attempts - successes
+        
+        # 2. Expand dimensions for broadcasting (Num_Problems x Num_K_Values)
+        pa = post_alpha[:, None]
+        pb = post_beta[:, None]
+        k_val = k_values[None, :]
+        
+        # 3. Compute the expected value of (1-theta)^k under each local posterior
+        # E[(1-theta)^k] = B(alpha, beta + k) / B(alpha, beta)
+        log_prob_fail = betaln(pa, pb + k_val) - betaln(pa, pb)
+        psi_posterior = 1.0 - np.exp(log_prob_fail)
+        assert psi_posterior.shape == (len(successes), len(k_values))
+        return psi_posterior # should be a (Num_Problems, Num_K_Values) array
+
+
+
 
     def _check_fitted(self):
         if not hasattr(self, "alpha_"):
