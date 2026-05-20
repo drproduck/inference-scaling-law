@@ -26,6 +26,30 @@ def pass_at_k_rates(data: np.ndarray, k_values: np.ndarray) -> np.ndarray:
         out[i] = np.mean([unbiased_pass_at_k(n_samples, int(c), k) for c in n_correct])
     return out
 
+def pass_at_k_rates_with_sample_variance(data: np.ndarray, k_values: np.ndarray):
+    """
+    data: (n_problems, n_samples) boolean or 0/1. 
+    Returns:
+        means: (len(k_values),) mean pass@k curve.
+        variances: (len(k_values),) variance of the mean pass@k curve.
+    """
+    n_problems, n_samples = data.shape
+    n_correct = np.sum(data, axis=1)  # (n_problems,)
+    
+    out_means = np.zeros(len(k_values))
+    out_vars = np.zeros(len(k_values))
+    
+    for i, k in enumerate(k_values):
+        prompt_scores = [unbiased_pass_at_k(n_samples, int(c), k) for c in n_correct]
+        out_means[i] = np.mean(prompt_scores)
+        # 3. Compute the variance of the mean (Standard Error squared)
+        if n_problems > 1:
+            out_vars[i] = np.var(prompt_scores, ddof=1) / n_problems
+        else:
+            out_vars[i] = 0.0
+            
+    return out_means, out_vars + 1e-12
+
 #################################################
 # adaptive sampling algorithms
 def kazdan_sampling(oracle_data, total_budget):
