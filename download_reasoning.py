@@ -29,3 +29,5 @@ for model in models:
 import pickle
 with open('r1_reasoning.pkl', 'wb') as f:
     pickle.dump(data_dict, f)
+
+# Prompt embeddings (MiniLM) for covariate estimators: run embed_reasoning.py

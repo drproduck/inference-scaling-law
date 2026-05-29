@@ -2,6 +2,9 @@ import numpy as np
 from scipy.optimize import minimize
 from scipy.stats import binom
 from scipy.special import betaln
+from scipy.special import logsumexp
+from sklearn.model_selection import KFold
+
 
 #################################################
 # pass at k basics
@@ -401,22 +404,9 @@ class BetaBinomialPassAtK:
         assert psi_posterior.shape == (len(successes), len(k_values))
         return psi_posterior # should be a (Num_Problems, Num_K_Values) array
 
-
-
-
     def _check_fitted(self):
         if not hasattr(self, "alpha_"):
             raise ValueError("Estimator not fitted. Call fit() first.")
-
-    def get_params(self, deep=True):
-        return {"random_state": self.random_state, "verbose": self.verbose}
-
-    def set_params(self, **params):
-        for k, v in params.items():
-            if k not in ("random_state", "verbose"):
-                raise ValueError(f"Invalid parameter {k}")
-            setattr(self, k, v)
-        return self
 
 
 class NPMLEBinomialPassAtK:
@@ -490,7 +480,8 @@ class NPMLEBinomialPassAtK:
         
         # 2. Grid Construction (baseline resolution fixed by constructor m_grid)
         base = np.linspace(0, 1, int(self.m_grid)) ** 3
-        self.t_ = epsilon + base * (1.0 - epsilon)
+        # self.t_ = epsilon + base * (1.0 - epsilon)
+        self.t_ = base
 
         if self.include_empirical_support:
             with np.errstate(divide="ignore", invalid="ignore"):
@@ -620,48 +611,185 @@ class NPMLEBinomialPassAtK:
         if not hasattr(self, "w_"):
             raise ValueError("Estimator not fitted. Call fit() first.")
 
-    def get_params(self, deep=True):
-        return {
-            "m_grid": self.m_grid,
-            "max_iter": self.max_iter,
-            "tol": self.tol,
-            "verbose": self.verbose,
-            "reg_alpha": self.reg_alpha,
-            "include_empirical_support": self.include_empirical_support,
-        }
 
-    def set_params(self, **params):
-        for k, v in params.items():
-            if k not in (
-                "m_grid",
-                "max_iter",
-                "tol",
-                "verbose",
-                "reg_alpha",
-                "include_empirical_support",
-            ):
-                raise ValueError(f"Invalid parameter {k}")
-            setattr(self, k, v)
-        return self
+# class BetaMixtureNPMLEPassAtK:
+#     """
+#     Estimate pass@k using a Mixture of Continuous Beta distributions via EM.
+
+#     Upgrades:
+#     - Added `reg_alpha` (Dirichlet Regularization) to the M-Step. This stabilizes
+#       the highly collinear overlapping continuous kernels, preventing the EM from 
+#       collapsing into noise.
+#     - Default `nu` lowered to 8.0 to match the theoretically optimal heavy-tail
+#       smoothing for small-N datasets like AIME and HMMT.
+
+#     Parameters
+#     ----------
+#     m_grid : int, default=400
+#         Number of grid components (Beta distributions) to mix.
+#     nu : float, default=8.0
+#         The concentration/smoothing parameter. Lower means wider smoothing.
+#     reg_alpha : float, default=0.001
+#         Dirichlet pseudo-counts added to the EM M-step. Crucial for stabilizing
+#         the continuous mixture.
+#     max_iter : int, default=5000
+#         Maximum number of Expectation-Maximization (EM) iterations.
+#     tol : float, default=1e-6
+#         Convergence tolerance for the maximum change in component weights.
+#     verbose : bool, default=False
+#         Whether to print convergence messages.
+#     """
+
+#     def __init__(self, m_grid=400, nu=8.0, reg_alpha=0.001, max_iter=5000, tol=1e-6, verbose=False):
+#         self.m_grid = m_grid
+#         self.nu = nu
+#         self.reg_alpha = reg_alpha
+#         self.max_iter = max_iter
+#         self.tol = tol
+#         self.verbose = verbose
+
+#     def fit(self, successes, attempts):
+#         successes = np.asarray(successes, dtype=float)
+#         attempts = np.asarray(attempts, dtype=float)
+#         self.successes_ = successes
+#         self.attempts_ = attempts
+#         self.n_problems_in_ = len(successes)
+        
+#         if len(successes) != len(attempts):
+#             raise ValueError("successes and attempts must have the same length")
+
+#         # 1. Define the Grid of Means (mu)
+#         # We strictly bound mu between 1e-5 and 1-1e-5. 
+#         epsilon = 1e-5
+#         base = np.linspace(0, 1, self.m_grid) ** 3
+#         mu_grid = epsilon + base * (1.0 - 2 * epsilon)
+
+#         # Inject empirical success rates (safely clipped)
+#         with np.errstate(divide="ignore", invalid="ignore"):
+#             p_hat = np.where(attempts > 0, successes / attempts, 0.0)
+#         empirical_grid = np.unique(p_hat[(p_hat > 0) & (p_hat < 1)])
+        
+#         self.mu_ = np.unique(np.concatenate([mu_grid, empirical_grid]))
+#         self.m_grid_actual_ = len(self.mu_)
+
+#         # 2. Define the Beta parameters for each component
+#         self.alpha_ = self.mu_ * self.nu
+#         self.beta_  = (1.0 - self.mu_) * self.nu
+
+#         # 3. Compute Beta-Binomial Likelihood Matrix (Log-Space for Stability)
+#         y = successes[:, None]
+#         k = attempts[:, None]
+#         a = self.alpha_[None, :]
+#         b = self.beta_[None, :]
+
+#         log_L = betaln(y + a, k - y + b) - betaln(a, b)
+        
+#         # Log-Sum-Exp Stabilization
+#         log_L -= np.max(log_L, axis=1, keepdims=True)
+#         L = np.exp(log_L)
+#         L = np.clip(L, 1e-15, None)
+
+#         # 4. Expectation-Maximization (EM) Loop with MAP Estimation
+#         w = np.ones(self.m_grid_actual_) / self.m_grid_actual_
+
+#         for it in range(self.max_iter):
+#             # E-Step: Compute posterior responsibilities
+#             joint = L * w[None, :]
+#             P = joint / joint.sum(axis=1, keepdims=True)
+            
+#             # M-Step: MAP Update with Dirichlet Regularization
+#             # Instead of standard MLE (P.mean), we add pseudo-counts
+#             sum_resp = P.sum(axis=0)
+#             w_new = (sum_resp + self.reg_alpha) / (self.n_problems_in_ + self.m_grid_actual_ * self.reg_alpha)
+
+#             if np.max(np.abs(w_new - w)) < self.tol:
+#                 if self.verbose:
+#                     print(f"Beta-Mixture NPMLE converged at iteration {it}")
+#                 break
+#             w = w_new
+#         else:
+#             if self.verbose:
+#                 print(f"Warning: Reached max_iter ({self.max_iter}) without strict convergence.")
+
+#         self.w_ = w
+#         return self
+
+#     def predict(self, k_values, method="integrated"):
+#         """Predict expected pass@k."""
+#         self._check_fitted()
+#         k_values = np.atleast_1d(k_values).astype(float)
+        
+#         if method == "integrated":
+#             k_matrix = k_values[:, None]  
+#             a = self.alpha_[None, :]     
+#             b = self.beta_[None, :]       
+
+#             log_fail_prob = betaln(a, b + k_matrix) - betaln(a, b)
+#             fail_prob = np.exp(log_fail_prob)
+            
+#             expected_failures = np.sum(self.w_[None, :] * fail_prob, axis=1)
+#             pass_at_k = 1.0 - expected_failures
+            
+#         elif method == "posterior":
+#             y = self.successes_[:, None]      
+#             m = self.attempts_[:, None]       
+#             a = self.alpha_[None, :]          
+#             b = self.beta_[None, :]           
+            
+#             post_a = a + y                    
+#             post_b = b + m - y                
+            
+#             log_L = betaln(post_a, post_b) - betaln(a, b)
+#             log_L -= np.max(log_L, axis=1, keepdims=True) 
+#             L = np.exp(log_L)
+            
+#             joint = L * self.w_[None, :]
+#             P = joint / joint.sum(axis=1, keepdims=True)  
+            
+#             pa = post_a[:, :, None]           
+#             pb = post_b[:, :, None]           
+#             k_val = k_values[None, None, :]   
+            
+#             log_fail_component = betaln(pa, pb + k_val) - betaln(pa, pb)
+#             fail_prob_component = np.exp(log_fail_component) 
+            
+#             P_expanded = P[:, :, None]        
+#             expected_fail_per_problem = np.sum(P_expanded * fail_prob_component, axis=1) 
+#             pass_at_k = 1.0 - expected_fail_per_problem.mean(axis=0)                       
+            
+#         else:
+#             raise ValueError(f"method must be 'integrated' or 'posterior', got {method!r}")
+
+#         if pass_at_k.size == 1:
+#             return float(pass_at_k[0])
+#         return pass_at_k
+
+#     def _check_fitted(self):
+#         if not hasattr(self, "w_"):
+#             raise ValueError("Estimator not fitted. Call fit() first.")
 
 
 class BetaMixtureNPMLEPassAtK:
     """
-    Estimate pass@k using a Non-parametric Maximum Likelihood Estimator (NPMLE)
-    where the prior is a mixture of continuous Beta distributions rather than 
-    discrete point masses.
+    Estimate pass@k using a Mixture of Continuous Beta distributions via EM.
 
-    This prevents the "zero-inflation asymptote" by ensuring all probability 
-    components have continuous, non-zero tails, allowing safe extrapolation 
-    to large k values.
+    Upgrades:
+    - Added `reg_alpha` (Dirichlet Regularization) to the M-Step. This stabilizes
+      the highly collinear overlapping continuous kernels, preventing the EM from 
+      collapsing into noise.
+    - Autotuned concentration (`nu="auto"`): Estimates the optimal global bandwidth 
+      by fitting a global Beta-Binomial MLE prior before initializing the mixture grid.
 
     Parameters
     ----------
     m_grid : int, default=400
         Number of grid components (Beta distributions) to mix.
-    nu : float, default=100.0
-        The concentration/smoothing parameter. Higher means sharper spikes 
-        (closer to standard NPMLE); lower means wider smoothing.
+    nu : float or str, default="auto"
+        The concentration/smoothing parameter. If "auto", it is estimated via 
+        a global Beta-Binomial Maximum Likelihood fit on the dataset. Lower means wider smoothing.
+    reg_alpha : float, default=0.001
+        Dirichlet pseudo-counts added to the EM M-step. Crucial for stabilizing
+        the continuous mixture.
     max_iter : int, default=5000
         Maximum number of Expectation-Maximization (EM) iterations.
     tol : float, default=1e-6
@@ -670,25 +798,153 @@ class BetaMixtureNPMLEPassAtK:
         Whether to print convergence messages.
     """
 
-    def __init__(self, m_grid=400, nu=100.0, max_iter=5000, tol=1e-6, verbose=False):
+    def __init__(self, m_grid=400, nu="auto", reg_alpha=0.001, max_iter=5000, tol=1e-6, verbose=False):
         self.m_grid = m_grid
         self.nu = nu
+        self.reg_alpha = reg_alpha
         self.max_iter = max_iter
         self.tol = tol
         self.verbose = verbose
+
+    def _estimate_global_nu(self, successes, attempts):
+        """
+        Estimates the optimal global concentration (nu = alpha + beta) 
+        using a robust Beta-Binomial MLE with multi-start optimization.
+        """
+        with np.errstate(divide="ignore", invalid="ignore"):
+            p_hat = np.where(attempts > 0, successes / attempts, np.nan)
+        p_hat = p_hat[np.isfinite(p_hat)]
+
+        def _mom_init(ph):
+            if ph.size < 2:
+                return 1.0, 1.0
+            m = float(np.mean(ph))
+            v = float(np.var(ph, ddof=1))
+            m = min(max(m, 1e-6), 1.0 - 1e-6)
+            vmax = m * (1.0 - m)
+            if not np.isfinite(v) or v <= 0 or v >= vmax:
+                return 1.0, 1.0
+            t = vmax / v - 1.0
+            a = max(m * t, 1e-5)
+            b = max((1.0 - m) * t, 1e-5)
+            return a, b
+
+        a0_mom, b0_mom = _mom_init(p_hat)
+
+        def nll_log_params(log_params):
+            alpha = np.exp(log_params[0])
+            beta = np.exp(log_params[1])
+            log_lik = betaln(successes + alpha, attempts - successes + beta) - betaln(alpha, beta)
+            return -np.sum(log_lik)
+
+        inits = [
+            (np.log(1.0), np.log(1.0)),
+            (np.log(a0_mom), np.log(b0_mom)),
+            (np.log(max(1e-3, a0_mom)), np.log(max(1e-3, b0_mom))),
+        ]
+
+        best = None
+        for x0 in inits:
+            res = minimize(nll_log_params, x0, method="L-BFGS-B")
+            if best is None or res.fun < best.fun:
+                best = res
+
+        if not best.success and self.verbose:
+            print("Warning: Global EB MLE optimization failed to converge. Falling back to best found.")
+
+        global_alpha = float(np.exp(best.x[0]))
+        global_beta = float(np.exp(best.x[1]))
+        return global_alpha + global_beta
+
+    def tune_nu(self, successes, attempts, nu_candidates=[0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0], n_splits=5):
+        """
+        Dynamically find the optimal concentration (nu) using K-Fold Cross Validation.
+        Minimizes the out-of-fold Negative Log-Likelihood.
+        """
+        successes = np.asarray(successes, dtype=float)
+        attempts = np.asarray(attempts, dtype=float)
+        
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        best_nu = None
+        best_nll = np.inf
+        
+        if self.verbose:
+            print(f"Starting CV tuning for nu across candidates: {nu_candidates}")
+
+        for test_nu in nu_candidates:
+            fold_nlls = []
+            
+            for train_idx, val_idx in kf.split(successes):
+                # 1. Train the mixture weights on the training fold using test_nu
+                # We temporarily override self.nu
+                self.nu = test_nu
+                
+                # Fit the model (this sets self.w_, self.mu_, etc.)
+                # Note: We suppress verbose output during CV
+                prev_verbose = self.verbose
+                self.verbose = False
+                self.fit(successes[train_idx], attempts[train_idx])
+                self.verbose = prev_verbose
+                
+                # 2. Evaluate Log-Likelihood on the validation fold
+                y_val = successes[val_idx][:, None]
+                k_val = attempts[val_idx][:, None]
+                a = self.alpha_[None, :]
+                b = self.beta_[None, :]
+
+                # L_val shape: (N_val, num_kernels)
+                log_L_val = betaln(y_val + a, k_val - y_val + b) - betaln(a, b)
+                
+                # Mixture likelihood: log(sum_j w_j * L_val_{i,j})
+                # Use logsumexp for stability
+                log_w = np.log(np.clip(self.w_, 1e-15, 1.0))
+                
+                max_log_L = np.max(log_L_val, axis=1, keepdims=True)
+                L_val_scaled = np.exp(log_L_val - max_log_L)
+                
+                # log(sum(w * L)) = max_log + log(sum(w * L_scaled))
+                val_log_lik = max_log_L.squeeze() + np.log(np.sum(self.w_[None, :] * L_val_scaled, axis=1))
+                
+                # Calculate mean Negative Log-Likelihood for this fold
+                fold_nlls.append(-np.mean(val_log_lik))
+                
+            mean_nll = np.mean(fold_nlls)
+            if self.verbose:
+                print(f"  nu = {test_nu:5.1f} | Mean Val NLL: {mean_nll:.4f}")
+                
+            if mean_nll < best_nll:
+                best_nll = mean_nll
+                best_nu = test_nu
+
+        if self.verbose:
+            print(f"Optimal nu found: {best_nu}")
+            
+        # Set the optimal nu and do a final fit on the entire dataset
+        self.nu = best_nu
+        self.fit(successes, attempts)
+        
+        return self
 
     def fit(self, successes, attempts):
         successes = np.asarray(successes, dtype=float)
         attempts = np.asarray(attempts, dtype=float)
         self.successes_ = successes
         self.attempts_ = attempts
+        self.n_problems_in_ = len(successes)
+        
         if len(successes) != len(attempts):
             raise ValueError("successes and attempts must have the same length")
 
-        # 1. Define the Grid of Means (mu)
-        # We use a polynomial grid for high resolution near zero.
-        # CRITICAL: We strictly bound mu between 1e-5 and 1-1e-5. 
-        # If mu is exactly 0 or 1, the Beta parameters become 0, and betaln returns NaN.
+        # 1. Establish the Concentration Parameter (nu)
+        if self.nu == "auto":
+            self.nu_ = self._estimate_global_nu(successes, attempts)
+            if self.verbose:
+                print(f"Auto-estimated global concentration (nu_): {self.nu_:.4f}")
+        else:
+            self.nu_ = float(self.nu)
+
+        # 2. Define the Grid of Means (mu)
+        # We strictly bound mu between 1e-5 and 1-1e-5. 
         epsilon = 1e-5
         base = np.linspace(0, 1, self.m_grid) ** 3
         mu_grid = epsilon + base * (1.0 - 2 * epsilon)
@@ -701,12 +957,11 @@ class BetaMixtureNPMLEPassAtK:
         self.mu_ = np.unique(np.concatenate([mu_grid, empirical_grid]))
         self.m_grid_actual_ = len(self.mu_)
 
-        # 2. Define the Beta parameters for each component
-        self.alpha_ = self.mu_ * self.nu
-        self.beta_  = (1.0 - self.mu_) * self.nu
+        # 3. Define the Beta parameters for each component
+        self.alpha_ = self.mu_ * self.nu_
+        self.beta_  = (1.0 - self.mu_) * self.nu_
 
-        # 3. Compute Beta-Binomial Likelihood Matrix (Log-Space for Stability)
-        # L_ij = Beta(y_i + alpha_j, k_i - y_i + beta_j) / Beta(alpha_j, beta_j)
+        # 4. Compute Beta-Binomial Likelihood Matrix (Log-Space for Stability)
         y = successes[:, None]
         k = attempts[:, None]
         a = self.alpha_[None, :]
@@ -714,21 +969,22 @@ class BetaMixtureNPMLEPassAtK:
 
         log_L = betaln(y + a, k - y + b) - betaln(a, b)
         
-        # Log-Sum-Exp Stabilization: Shift each row by its maximum to prevent exp() underflow
+        # Log-Sum-Exp Stabilization
         log_L -= np.max(log_L, axis=1, keepdims=True)
         L = np.exp(log_L)
         L = np.clip(L, 1e-15, None)
 
-        # 4. Expectation-Maximization (EM) Loop
+        # 5. Expectation-Maximization (EM) Loop with MAP Estimation
         w = np.ones(self.m_grid_actual_) / self.m_grid_actual_
 
         for it in range(self.max_iter):
-            # E-Step: Compute posterior probabilities
+            # E-Step: Compute posterior responsibilities
             joint = L * w[None, :]
             P = joint / joint.sum(axis=1, keepdims=True)
             
-            # M-Step: Update mixture weights
-            w_new = P.mean(axis=0)
+            # M-Step: MAP Update with Dirichlet Regularization
+            sum_resp = P.sum(axis=0)
+            w_new = (sum_resp + self.reg_alpha) / (self.n_problems_in_ + self.m_grid_actual_ * self.reg_alpha)
 
             if np.max(np.abs(w_new - w)) < self.tol:
                 if self.verbose:
@@ -740,71 +996,50 @@ class BetaMixtureNPMLEPassAtK:
                 print(f"Warning: Reached max_iter ({self.max_iter}) without strict convergence.")
 
         self.w_ = w
-        self.n_problems_in_ = len(successes)
         return self
 
     def predict(self, k_values, method="integrated"):
-        """
-        Predict expected pass@k.
-        
-        Parameters
-        ----------
-        k_values : array-like
-            The values of k to evaluate pass@k for.
-        method : {"integrated", "posterior"}, default="integrated"
-            "integrated": Evaluates the expectation over the global learned prior.
-            "posterior": Evaluates the expectation over the localized posterior 
-                         for each individual problem, then averages.
-        """
+        """Predict expected pass@k."""
         self._check_fitted()
         k_values = np.atleast_1d(k_values).astype(float)
         
         if method == "integrated":
-            # 1. Global prior components
-            k_matrix = k_values[:, None]  # Shape: (K, 1)
-            a = self.alpha_[None, :]      # Shape: (1, M)
-            b = self.beta_[None, :]       # Shape: (1, M)
+            k_matrix = k_values[:, None]  
+            a = self.alpha_[None, :]     
+            b = self.beta_[None, :]       
 
-            # 2. Integrate (1-theta)^k against each global Beta component
             log_fail_prob = betaln(a, b + k_matrix) - betaln(a, b)
             fail_prob = np.exp(log_fail_prob)
             
-            # 3. Weight by global mixture weights (w_)
             expected_failures = np.sum(self.w_[None, :] * fail_prob, axis=1)
             pass_at_k = 1.0 - expected_failures
             
         elif method == "posterior":
-            # 1. Local Posterior Beta Parameters for all problems and components
-            y = self.successes_[:, None]      # Shape: (N, 1)
-            m = self.attempts_[:, None]       # Shape: (N, 1)
-            a = self.alpha_[None, :]          # Shape: (1, M)
-            b = self.beta_[None, :]           # Shape: (1, M)
+            y = self.successes_[:, None]      
+            m = self.attempts_[:, None]       
+            a = self.alpha_[None, :]          
+            b = self.beta_[None, :]           
             
-            post_a = a + y                    # Shape: (N, M)
-            post_b = b + m - y                # Shape: (N, M)
+            post_a = a + y                    
+            post_b = b + m - y                
             
-            # 2. Calculate Local Posterior Mixture Weights (P_ij)
-            # The probability that problem i belongs to component j
             log_L = betaln(post_a, post_b) - betaln(a, b)
-            log_L -= np.max(log_L, axis=1, keepdims=True) # Stabilize
+            log_L -= np.max(log_L, axis=1, keepdims=True) 
             L = np.exp(log_L)
             
             joint = L * self.w_[None, :]
-            P = joint / joint.sum(axis=1, keepdims=True)  # Shape: (N, M)
+            P = joint / joint.sum(axis=1, keepdims=True)  
             
-            # 3. Expand dimensions for 3D broadcasting (Problems x Components x K_values)
-            pa = post_a[:, :, None]           # Shape: (N, M, 1)
-            pb = post_b[:, :, None]           # Shape: (N, M, 1)
-            k_val = k_values[None, None, :]   # Shape: (1, 1, K)
+            pa = post_a[:, :, None]           
+            pb = post_b[:, :, None]           
+            k_val = k_values[None, None, :]   
             
-            # 4. Integrate (1-theta)^k against each local posterior component
             log_fail_component = betaln(pa, pb + k_val) - betaln(pa, pb)
-            fail_prob_component = np.exp(log_fail_component) # Shape: (N, M, K)
+            fail_prob_component = np.exp(log_fail_component) 
             
-            # 5. Weight by local posterior weights (P) and average across problems
-            P_expanded = P[:, :, None]        # Shape: (N, M, 1)
-            expected_fail_per_problem = np.sum(P_expanded * fail_prob_component, axis=1) # Shape: (N, K)
-            pass_at_k = 1.0 - expected_fail_per_problem.mean(axis=0)                       # Shape: (K,)
+            P_expanded = P[:, :, None]        
+            expected_fail_per_problem = np.sum(P_expanded * fail_prob_component, axis=1) 
+            pass_at_k = 1.0 - expected_fail_per_problem.mean(axis=0)                        
             
         else:
             raise ValueError(f"method must be 'integrated' or 'posterior', got {method!r}")
@@ -817,163 +1052,1121 @@ class BetaMixtureNPMLEPassAtK:
         if not hasattr(self, "w_"):
             raise ValueError("Estimator not fitted. Call fit() first.")
 
-    def get_params(self, deep=True):
-        return {
-            "m_grid": self.m_grid, 
-            "nu": self.nu, 
-            "max_iter": self.max_iter, 
-            "tol": self.tol, 
-            "verbose": self.verbose
-        }
-
-    def set_params(self, **params):
-        for param, value in params.items():
-            if param not in self.get_params():
-                raise ValueError(f"Invalid parameter {param}")
-            setattr(self, param, value)
-        return self
-
-
-import numpy as np
-from scipy.stats import binom
-from scipy.interpolate import BSpline
-from scipy.optimize import minimize
-
-class EfronGModelPassAtK:
+class SplicedPosteriorPassAtK:
     """
-    Empirical Bayes Pass@k Estimator using Efron's g-modeling.
-    
-    Models the unknown prior density as an exponential family distribution 
-    based on a natural cubic B-spline basis. This guarantees a smooth, 
-    continuous prior, eliminating boundary bias and discrete overfitting.
+    A hybrid estimator that resolves Beta misspecification at small k 
+    and NPMLE zero-collapse at large k via Posterior Splicing.
 
-    Parameters
-    ----------
-    m_grid : int, default=400
-        Number of grid points to evaluate the splines over.
-    df : int, default=5
-        Degrees of freedom (number of spline basis functions). Efron typically 
-        uses 5. Higher df means more flexibility but higher variance.
-    l2_reg : float, default=1e-4
-        A tiny Ridge penalty on the spline coefficients to ensure the convex 
-        optimizer never diverges.
-    verbose : bool, default=False
-        Whether to print convergence details.
+    - Problems with observed successes (y > 0) use the NPMLE posterior, 
+      perfectly capturing empirical modes and structural 'lumps' for small k.
+    - Problems with zero successes (y == 0) use the Beta posterior, 
+      leveraging its alpha < 1 infinite asymptote to provide rigorous 
+      tail-regularization for large k extrapolation.
     """
-    def __init__(self, m_grid=400, df=5, l2_reg=1e-4, verbose=False):
-        if df < 4:
-            raise ValueError("df must be >= 4 for cubic B-splines.")
-        self.m_grid = m_grid
-        self.df = df
-        self.l2_reg = l2_reg
-        self.verbose = verbose
-
-    def _get_bspline_basis(self, x):
-        """Generates a cubic B-spline design matrix for the grid x."""
-        degree = 3
-        # Efron distributes knots based on the quantiles of the grid
-        n_inner_knots = self.df - degree - 1
-        quantiles = np.linspace(0, 1, n_inner_knots + 2)
-        knots = np.quantile(x, quantiles)
-        
-        # Pad knots for boundary conditions
-        t_knots = np.concatenate(([knots[0]]*degree, knots, [knots[-1]]*degree))
-        
-        Q = np.zeros((len(x), self.df))
-        for i in range(self.df):
-            c = np.zeros(self.df)
-            c[i] = 1.0
-            Q[:, i] = BSpline(t_knots, c, degree)(x)
-        return Q
+    def __init__(self, beta_estimator, npmle_estimator):
+        self.beta = beta_estimator
+        self.npmle = npmle_estimator
 
     def fit(self, successes, attempts):
-        successes = np.asarray(successes, dtype=float)
-        attempts = np.asarray(attempts, dtype=float)
-        N = len(successes)
-
-        # 1. Define Grid (We still use polynomial to maintain high resolution near zero)
-        epsilon = 1.0 / np.sum(attempts)
-        base = np.linspace(0, 1, self.m_grid) ** 3
-        self.t_ = epsilon + base * (1.0 - epsilon)
+        self.successes_ = np.asarray(successes, dtype=float)
+        self.attempts_ = np.asarray(attempts, dtype=float)
+        self.n_problems_in_ = len(self.successes_)
         
-        # 2. Build the Spline Basis Matrix (Q)
-        self.Q_ = self._get_bspline_basis(self.t_)
-
-        # 3. Construct Likelihood Matrix
-        L = binom.pmf(successes[:, None], attempts[:, None], self.t_[None, :])
-        L = np.clip(L, 1e-15, None)
-
-        # 4. Define Objective and Gradient
-        def objective_and_gradient(alpha):
-            # Calculate weights: w = exp(Q * alpha) / sum(exp(Q * alpha))
-            log_w_unnorm = self.Q_ @ alpha
-            log_w_unnorm -= np.max(log_w_unnorm)  # Prevent exp overflow
-            w_unnorm = np.exp(log_w_unnorm)
-            w = w_unnorm / np.sum(w_unnorm)
-
-            # Marginal likelihoods for each observation
-            m_i = L @ w
-            m_i_safe = np.clip(m_i, 1e-15, None)
-            
-            # Negative Log-Likelihood + L2 Regularization
-            neg_log_lik = -np.sum(np.log(m_i_safe)) + 0.5 * self.l2_reg * np.sum(alpha**2)
-
-            # --- The Elegant Analytical Gradient ---
-            # Posterior probability matrix: P(theta_j | y_i)
-            P = (L * w[None, :]) / m_i_safe[:, None]
-            
-            # Expected spline basis under the PRIOR
-            E_prior = w @ self.Q_
-            
-            # Expected spline basis under the POSTERIORS
-            N_j = np.sum(P, axis=0)  # Sum of posteriors across all N observations
-            E_post = (N_j @ self.Q_) / N
-            
-            # Gradient is strictly the difference between Prior and Posterior expectations
-            grad = -N * (E_post - E_prior) + self.l2_reg * alpha
-            
-            return neg_log_lik, grad
-
-        # 5. Optimize Spline Coefficients
-        # Initialize alpha to zeros (which creates a uniform prior)
-        alpha_init = np.zeros(self.df)
-        
-        res = minimize(
-            objective_and_gradient, 
-            alpha_init, 
-            method="L-BFGS-B", 
-            jac=True,
-            options={'ftol': 1e-9, 'maxiter': 1000}
-        )
-        
-        if not res.success and self.verbose:
-            print(f"Warning: L-BFGS-B failed to converge: {res.message}")
-        elif self.verbose:
-            print(f"g-model converged in {res.nit} iterations.")
-
-        self.alpha_ = res.x
-        
-        # Compute the final, smoothed probability weights
-        log_w = self.Q_ @ self.alpha_
-        w_unnorm = np.exp(log_w - np.max(log_w))
-        self.w_ = w_unnorm / np.sum(w_unnorm)
+        # Fit both independent models
+        self.beta.fit(self.successes_, self.attempts_)
+        self.npmle.fit(self.successes_, self.attempts_)
         
         return self
 
     def predict(self, k_values):
+        """
+        Predict pass@k using the spliced posteriors.
+        Note: Because this relies on problem-level routing, it only supports 
+        the 'posterior' expectation method.
+        """
         self._check_fitted()
         k_values = np.atleast_1d(k_values).astype(float)
         
-        t_matrix = self.t_[None, :]
-        k_matrix = k_values[:, None]
+        # 1. Get the expected failures per problem from the Beta model
+        # E[(1-theta)^k] = B(alpha_post, beta_post + k) / B(alpha_post, beta_post)
+        pa = self.beta.alpha_ + self.successes_
+        pb = self.beta.beta_ + self.attempts_ - self.successes_
         
-        expected_failures = np.sum(self.w_ * ((1.0 - t_matrix) ** k_matrix), axis=1)
-        pass_at_k = 1.0 - expected_failures
+        from scipy.special import betaln
+        log_fail_beta = betaln(pa[:, None], pb[:, None] + k_values[None, :]) - betaln(pa[:, None], pb[:, None])
+        failures_beta = np.exp(log_fail_beta) # Shape: (n_problems, len_k)
+        
+        # 2. Get the expected failures per problem from the NPMLE model
+        t_row = np.clip(self.npmle.t_[None, :], 1e-10, 1.0 - 1e-10)
+        one_minus_t_pow = (1.0 - t_row) ** k_values[:, None]
+        failures_npmle = self.npmle.posterior_weights_ @ one_minus_t_pow.T # Shape: (n_problems, len_k)
+        
+        # 3. Splice! 
+        # If y == 0, use Beta tail. If y > 0, use NPMLE empirical precision.
+        mask_zero = (self.successes_ == 0)
+        
+        expected_failures = np.where(
+            mask_zero[:, None], 
+            failures_beta, 
+            failures_npmle
+        )
+        
+        # Average across the dataset
+        pass_at_k = 1.0 - np.mean(expected_failures, axis=0)
+        self._psi = 1.0 - expected_failures
         
         if pass_at_k.size == 1:
             return float(pass_at_k[0])
         return pass_at_k
 
     def _check_fitted(self):
+        if not hasattr(self, "successes_"):
+            raise ValueError("Estimator not fitted. Call fit() first.")
+
+
+class KSplicedPassAtK:
+    """
+    A temporal-spliced estimator that optimizes for WRMSE during interpolation (k <= m)
+    while controlling extrapolation (k > m) with Beta-based tails.
+
+    - k <= m: Uses the Regularized NPMLE, strictly adhering to the empirical modes.
+    - k > m: Depends on ``extrapolation``:
+             * ``multiplicative_beta_decay`` (default): for k>m, multiples the NPMLE
+               failure rate at an ``anchor_k`` by Beta posterior failure ratios relative
+               to the same anchor. By default ``anchor_k = m`` (continuous splice at k=m);
+               set ``tail_decay_anchor_k`` to an earlier ``k<m`` if you want the decay
+               shape tuned from that point without moving the NPMLE cutoff ``m``.
+             * ``beta_posterior``: uses the Beta–Binomial posterior pass@k directly
+               (no NPMLE anchor in the tail; ``tail_decay_anchor_k`` is ignored).
+
+    Parameters
+    ----------
+    beta_estimator : estimator object
+        An instantiated BetaBinomialPassAtK model.
+    npmle_estimator : estimator object
+        An instantiated NPMLEBinomialPassAtK model (ideally with reg_alpha=0.001).
+    m_budget : int or float, default=None
+        The point k at which to splice the curves. If None, it defaults to the
+        maximum number of attempts observed in the training data.
+    extrapolation : {"multiplicative_beta_decay", "beta_posterior"}, optional
+        How to extrapolate beyond ``m_budget``. Default matches the legacy
+        multiplicative Beta-decay splice; ``beta_posterior`` switches the tail to pure
+        Beta posterior predictions.
+    tail_decay_anchor_k : int or float or None, default=None
+        For ``extrapolation="multiplicative_beta_decay"`` only: the k at which NPMLE and
+        Beta failure rates anchor the Beta decay ratios. Must satisfy
+        ``0 < tail_decay_anchor_k <= m``. If ``None``, uses ``m`` (backward compatible).
+
+    Raises
+    ------
+    ValueError
+        If ``extrapolation`` is not recognized, or anchor k is invalid.
+
+    """
+    _EXTRAPOLATION_OPTS = frozenset({"multiplicative_beta_decay", "beta_posterior"})
+    _EXTRAPOLATION_ALIAS = {
+        "beta": "beta_posterior",
+        "decay": "multiplicative_beta_decay",
+    }
+
+    def __init__(
+        self,
+        beta_estimator,
+        npmle_estimator,
+        m_budget=None,
+        extrapolation="multiplicative_beta_decay",
+        tail_decay_anchor_k=None,
+    ):
+        if isinstance(extrapolation, str):
+            extrapolation = extrapolation.strip().replace("-", "_")
+            extrapolation = self._EXTRAPOLATION_ALIAS.get(extrapolation, extrapolation)
+        if extrapolation not in self._EXTRAPOLATION_OPTS:
+            raise ValueError(
+                f"extrapolation must be one of {sorted(self._EXTRAPOLATION_OPTS)} "
+                f"(or aliases {sorted(self._EXTRAPOLATION_ALIAS)}), got {extrapolation!r}"
+            )
+        self.beta = beta_estimator
+        self.npmle = npmle_estimator
+        self.m_budget = m_budget
+        self.extrapolation = extrapolation
+        self.tail_decay_anchor_k = tail_decay_anchor_k
+
+    def fit(self, successes, attempts):
+        self.successes_ = np.asarray(successes, dtype=float)
+        self.attempts_ = np.asarray(attempts, dtype=float)
+        
+        # Fit both underlying models
+        self.beta.fit(self.successes_, self.attempts_)
+        self.npmle.fit(self.successes_, self.attempts_)
+        
+        # Determine the splicing boundary (m)
+        if self.m_budget is None:
+            # Default to the max budget observed in the dataset
+            self.m_  = np.max(self.attempts_)
+        else:
+            self.m_ = float(self.m_budget)
+            
+        return self
+
+    def predict(self, k_values):
+        """
+        Predict pass@k using the k-spliced curve.
+        """
+        self._check_fitted()
+        k_values = np.atleast_1d(k_values).astype(float)
+        
+        # 1. Get raw predictions from both models for the requested k_values
+        # Wrap in np.atleast_1d to handle the underlying models unwrapping size-1 arrays to floats
+        pass_npmle_k = np.atleast_1d(self.npmle.predict(k_values))
+        pass_beta_k = np.atleast_1d(self.beta.predict(k_values, method="posterior"))
+        
+        failures_npmle_k = 1.0 - pass_npmle_k
+        failures_beta_k = 1.0 - pass_beta_k
+        
+        # 2. Anchors for multiplicative Beta decay at k = decay_anchor_k (default m_)
+        if self.extrapolation == "multiplicative_beta_decay":
+            anchor_k = (
+                float(self.m_)
+                if self.tail_decay_anchor_k is None
+                else float(self.tail_decay_anchor_k)
+            )
+            if not np.isfinite(anchor_k) or anchor_k <= 0:
+                raise ValueError(
+                    f"tail_decay_anchor_k must be positive (got {anchor_k})"
+                )
+            if anchor_k > self.m_:
+                raise ValueError(
+                    f"tail_decay_anchor_k must be <= m={self.m_} (got {anchor_k}); "
+                    "use NPMLE cutoff m_budget for the splice, not anchor."
+                )
+
+            pass_npmle_anchor = np.atleast_1d(self.npmle.predict([anchor_k]))
+            pass_beta_anchor = np.atleast_1d(
+                self.beta.predict([anchor_k], method="posterior")
+            )
+            failures_npmle_anchor = 1.0 - pass_npmle_anchor[0]
+            failures_beta_anchor = 1.0 - pass_beta_anchor[0]
+
+        # 3. Splice NPMLE where k <= m and chosen tail beyond m
+        le_m = k_values <= self.m_
+        final_failures = np.zeros_like(k_values, dtype=float)
+        final_failures[le_m] = failures_npmle_k[le_m]
+
+        if self.extrapolation == "multiplicative_beta_decay":
+            decay_ratio = failures_beta_k[~le_m] / (failures_beta_anchor + 1e-12)
+            final_failures[~le_m] = failures_npmle_anchor * decay_ratio
+        else:
+            # beta_posterior: pure Beta pass@k for k > m
+            final_failures[~le_m] = failures_beta_k[~le_m]
+
+        pass_at_k = 1.0 - final_failures
+        
+        if pass_at_k.size == 1:
+            return float(pass_at_k[0])
+        return pass_at_k
+
+    def _check_fitted(self):
+        if not hasattr(self, "m_"):
+            raise ValueError("Estimator not fitted. Call fit() first.")
+
+
+class TailStitchedNPMLEPassAtK(NPMLEBinomialPassAtK):
+    """
+    Estimate pass@k using NPMLE with post-hoc Extreme Value Theory (EVT) tail stitching.
+    
+    This inherits the exact EM fitting process of the standard NPMLE, preserving its 
+    ability to perfectly capture structural modes (like deterministic problems). 
+    However, during prediction, the lowest discrete point mass (the "impossible" problems) 
+    is surgically replaced by a continuous Beta(1, beta_tail) distribution with the 
+    exact same mean. This guarantees a closed-form, polynomial decay for extreme 
+    large-k extrapolation, eliminating zero-collapse.
+    """
+    
+    def predict(self, k_values, method="integrated", bias_correct=False):
+        """
+        Predict pass@k for given k values with a stitched continuous left tail.
+        """
+        self._check_fitted()
+        k_values = np.atleast_1d(k_values).astype(float)
+        n_p = self.n_problems_in_
+
+        # --- 1. Tail Stitching Setup ---
+        # The grid (self.t_) is strictly sorted via np.unique during fit()
+        t_0 = self.t_[0] 
+        w_0 = self.w_[0]
+        
+        # Calculate the Beta parameter that perfectly preserves the mean of the point mass
+        beta_tail = (1.0 - t_0) / t_0
+        
+        # Closed-form integration of expected failures for the continuous Beta tail: 
+        # Integral of (1-theta)^k * Beta(1, beta_tail)
+        tail_decay = beta_tail / (k_values + beta_tail) # shape: (len_k,)
+
+        # Isolate the rest of the discrete grid
+        t_rest = np.clip(self.t_[1:], 1e-10, 1.0 - 1e-10) # shape: (m_grid - 1,)
+        w_rest = self.w_[1:]
+        
+        k_matrix = k_values[:, None] # shape: (len_k, 1)
+        one_minus_t_pow_rest = (1.0 - t_rest[None, :]) ** k_matrix # shape: (len_k, m_grid - 1)
+
+        # --- 2. Predictions ---
+        if method == "integrated":
+            # Failures from the discrete bulk
+            expected_failures_rest = np.sum(w_rest * one_minus_t_pow_rest, axis=1)
+            
+            # Combine with failures from the continuous tail
+            expected_failures = expected_failures_rest + (w_0 * tail_decay)
+            
+            pass_at_k = 1.0 - expected_failures
+            self._psi = np.broadcast_to(pass_at_k, (n_p, len(k_values))).copy()
+
+        elif method == "posterior":
+            # Isolate the local posterior responsibility for the lowest point vs the rest
+            pw_0 = self.posterior_weights_[:, 0]  # shape: (n_problems,)
+            pw_rest = self.posterior_weights_[:, 1:] # shape: (n_problems, m_grid - 1)
+            
+            # E[(1-theta)^k | data_i] for the bulk
+            expected_fail_rest = pw_rest @ one_minus_t_pow_rest.T # (n_problems, len_k)
+            
+            # E[(1-theta)^k | data_i] for the tail
+            expected_fail_tail = pw_0[:, None] * tail_decay[None, :] # (n_problems, len_k)
+            
+            expected_fail_per_problem = expected_fail_rest + expected_fail_tail
+            pass_at_k = 1.0 - np.mean(expected_fail_per_problem, axis=0)
+            self._psi = 1.0 - expected_fail_per_problem
+
+        elif method == "plugin":
+            # Note: Because we set the mean of the Beta tail to exactly equal t_0, 
+            # the local expected value (theta_hat) for each problem is completely unchanged.
+            # Therefore, we can safely use the standard NPMLE logic for the plug-in estimator.
+            theta_hat = self.posterior_means_[None, :]  # (1, n_problems)
+            expected_failures = (1.0 - theta_hat) ** k_matrix  # (len_k, n_problems)
+
+            if bias_correct:
+                empirical_means = self.successes_ / self.attempts_
+                correction = (
+                    k_matrix
+                    * (1.0 - theta_hat) ** (k_matrix - 1.0)
+                    * (empirical_means[None, :] - theta_hat)
+                )
+                expected_failures -= correction
+
+            expected_failures = np.clip(expected_failures, 0.0, 1.0)
+            pass_at_k = 1.0 - np.mean(expected_failures, axis=1)
+            self._psi = (1.0 - expected_failures).T
+
+        else:
+            raise ValueError(
+                f"method must be 'integrated', 'posterior', or 'plugin', got {method!r}"
+            )
+
+        if pass_at_k.size == 1:
+            return float(pass_at_k[0])
+        return pass_at_k
+
+
+class MixtureBinomialPassAtK:
+    """
+    Estimate pass@k using a Semi-Parametric Mixture model (Beta + NPMLE).
+
+    Fits a prior that is a mixture of a continuous Beta(alpha, beta) distribution
+    and a discrete non-parametric grid. This combines the NPMLE's ability to model 
+    complex structural probabilities with the Beta distribution's crucial tail 
+    regularization to prevent zero-collapse during large-k extrapolation.
+
+    Parameters
+    ----------
+    m_grid : int, default=300
+        The number of uniform grid points for the discrete component.
+    max_iter : int, default=500
+        Maximum number of Expectation-Maximization (EM) iterations.
+    tol : float, default=1e-5
+        Convergence tolerance for the total log-likelihood.
+    verbose : bool, default=True
+        Whether to print convergence messages.
+    reg_alpha : float, default=0.0
+        Dirichlet regularization strength for the discrete weights.
+    include_empirical_support : bool, default=True
+        If True, unique non-zero sample proportions are unioned into the grid.
+
+    Attributes
+    ----------
+    lambda_ : float
+        The mixture weight assigned to the continuous Beta component (0 to 1).
+    alpha_ : float
+        Fitted alpha parameter of the Beta distribution.
+    beta_ : float
+        Fitted beta parameter of the Beta distribution.
+    t_ : ndarray of shape (n_support_,)
+        The discrete grid points representing possible success rates.
+    w_ : ndarray of shape (n_support_,)
+        The probability mass assigned to each grid point (sums to 1).
+    """
+
+    def __init__(
+        self,
+        m_grid=300,
+        max_iter=500,
+        tol=1e-5,
+        verbose=True,
+        reg_alpha=0.0,
+        include_empirical_support=True,
+    ):
+        self.m_grid = m_grid
+        self.max_iter = max_iter
+        self.tol = tol
+        self.verbose = verbose
+        self.reg_alpha = reg_alpha
+        self.include_empirical_support = include_empirical_support
+
+    def fit(self, successes, attempts):
+        self.n_problems_in_ = len(successes)
+        self.successes_ = np.asarray(successes, dtype=float)
+        self.attempts_ = np.asarray(attempts, dtype=float)
+        
+        y = self.successes_
+        n = self.attempts_
+
+        # 1. Setup Discrete Grid (NPMLE Base)
+        epsilon = 1.0 / np.sum(n)
+        base = np.linspace(0, 1, int(self.m_grid)) ** 3
+        self.t_ = epsilon + base * (1.0 - epsilon)
+
+        if self.include_empirical_support:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                p_hat = np.where(n > 0, y / n, 0.0)
+            empirical_grid = np.unique(p_hat[p_hat > 0])
+            self.t_ = np.unique(np.concatenate([self.t_, empirical_grid]))
+            
+        self.n_support_ = len(self.t_)
+        t_safe = np.clip(self.t_, 1e-10, 1.0 - 1e-10)
+
+        # Precompute the fixed discrete log-likelihoods (N_problems x N_support)
+        # Note: We drop the binomial coefficient as it cancels out in EM responsibilities
+        self._log_L_discrete = y[:, None] * np.log(t_safe)[None, :] + (n - y)[:, None] * np.log(1.0 - t_safe)[None, :]
+
+        # 2. Initialize Parameters
+        self.lambda_ = 0.5  # Start with an even mixture
+        self.w_ = np.ones(self.n_support_) / self.n_support_
+        
+        # MOM init for Beta component
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ph = np.where(n > 0, y / n, np.nan)
+        ph = ph[np.isfinite(ph)]
+        
+        def _mom_init(p_arr):
+            if p_arr.size < 2: return 1.0, 1.0
+            m, v = float(np.mean(p_arr)), float(np.var(p_arr, ddof=1))
+            m = min(max(m, 1e-6), 1.0 - 1e-6)
+            vmax = m * (1.0 - m)
+            if not np.isfinite(v) or v <= 0 or v >= vmax: return 1.0, 1.0
+            t = vmax / v - 1.0
+            return max(m * t, 1e-5), max((1.0 - m) * t, 1e-5)
+
+        self.alpha_, self.beta_ = _mom_init(ph)
+
+        # 3. Expectation-Maximization Loop
+        prev_ll = -np.inf
+        
+        for it in range(self.max_iter):
+            # --- E-STEP ---
+            # Calculate Beta Log-Likelihoods (N_problems,)
+            log_L_beta = betaln(y + self.alpha_, n - y + self.beta_) - betaln(self.alpha_, self.beta_)
+            
+            # Construct Joint Log-Likelihood Matrix (N_problems x (1 + N_support))
+            # Column 0 is the Beta component, Columns 1+ are the Discrete points
+            col_beta = np.log(self.lambda_ + 1e-15) + log_L_beta
+            cols_discrete = np.log(1.0 - self.lambda_ + 1e-15) + np.log(self.w_ + 1e-15)[None, :] + self._log_L_discrete
+            
+            log_joint = np.column_stack([col_beta, cols_discrete])
+            
+            # Responsibilities via logsumexp for stability
+            log_marginal = logsumexp(log_joint, axis=1) # (N_problems,)
+            log_gamma = log_joint - log_marginal[:, None]
+            gamma = np.exp(log_gamma) # (N_problems x (1 + N_support))
+            
+            gamma_beta = gamma[:, 0]
+            gamma_discrete = gamma[:, 1:]
+            
+            current_ll = np.sum(log_marginal)
+            
+            # Check convergence
+            if np.abs(current_ll - prev_ll) < self.tol:
+                if self.verbose:
+                    print(f"Mixture EM converged at iteration {it} (Total LL: {current_ll:.2f})")
+                break
+            prev_ll = current_ll
+            
+            # --- M-STEP ---
+            # 1. Update mixture weight
+            # self.lambda_ = np.clip(np.mean(gamma_beta), 1e-5, 1.0 - 1e-5)
+            self.lambda_ = np.clip(np.mean(gamma_beta), 0.3, 0.9)
+            
+            # 2. Update discrete weights (with optional Dirichlet regularization)
+            expected_counts = np.sum(gamma_discrete, axis=0)
+            if self.reg_alpha > 0:
+                smoothed = expected_counts + self.reg_alpha
+                self.w_ = smoothed / np.sum(smoothed)
+            else:
+                self.w_ = expected_counts / np.sum(expected_counts)
+                
+            # 3. Update Beta parameters (Weighted MLE)
+            if self.lambda_ > 1e-4:  # Only optimize if Beta component is actually used
+                def nll_log_params(log_params):
+                    a, b = np.exp(log_params)
+                    ll = betaln(y + a, n - y + b) - betaln(a, b)
+                    return -np.sum(gamma_beta * ll)
+                
+                res = minimize(
+                    nll_log_params, 
+                    x0=(np.log(self.alpha_), np.log(self.beta_)), 
+                    method="L-BFGS-B"
+                )
+                self.alpha_, self.beta_ = np.exp(res.x)
+
+        # Store final posteriors for predictions
+        self.posterior_gamma_beta_ = gamma_beta
+        self.posterior_gamma_discrete_ = gamma_discrete
+
+        return self
+
+    def predict(self, k_values, method="integrated"):
+        """
+        Predict pass@k for given k values.
+        """
+        self._check_fitted()
+        k_values = np.atleast_1d(k_values).astype(float)
+        
+        t_row = np.clip(self.t_[None, :], 1e-10, 1.0 - 1e-10)
+        k_matrix = k_values[:, None]
+        one_minus_t_pow = (1.0 - t_row) ** k_matrix # (len_k, n_support)
+        
+        if method == "integrated":
+            # 1. Expected failure rate under Global Beta
+            fail_beta = np.exp(betaln(self.alpha_, self.beta_ + k_values) - betaln(self.alpha_, self.beta_))
+            
+            # 2. Expected failure rate under Global NPMLE
+            fail_discrete = np.sum(self.w_ * one_minus_t_pow, axis=1)
+            
+            # Mixture
+            expected_failures = (self.lambda_ * fail_beta) + ((1.0 - self.lambda_) * fail_discrete)
+            pass_at_k = 1.0 - expected_failures
+            
+            self._psi = np.broadcast_to(pass_at_k, (self.n_problems_in_, len(k_values))).copy()
+
+        elif method == "posterior":
+            # For each problem, the posterior is a mixture of the updated Beta and the discrete grid
+            pa = self.alpha_ + self.successes_
+            pb = self.beta_ + self.attempts_ - self.successes_
+            
+            # Failure rate under local Beta Posterior: E[(1-theta)^k] = B(a_post, b_post + k) / B(a_post, b_post)
+            log_fail_beta = betaln(pa[:, None], pb[:, None] + k_values[None, :]) - betaln(pa[:, None], pb[:, None])
+            fail_beta = np.exp(log_fail_beta) # (n_problems, len_k)
+            
+            # Failure rate under local NPMLE Posterior
+            fail_discrete = self.posterior_gamma_discrete_ @ one_minus_t_pow.T # (n_problems, len_k)
+            
+            # Combine based on problem-specific component responsibilities
+            gamma_b = self.posterior_gamma_beta_[:, None]
+            expected_failures = (gamma_b * fail_beta) + fail_discrete 
+            
+            pass_at_k = 1.0 - np.mean(expected_failures, axis=0)
+            self._psi = 1.0 - expected_failures
+
+        elif method == "plugin":
+            # Expected theta under local Beta
+            theta_beta = (self.alpha_ + self.successes_) / (self.alpha_ + self.beta_ + self.attempts_)
+            # Expected theta under local NPMLE
+            theta_discrete = np.sum(self.posterior_gamma_discrete_ * self.t_[None, :], axis=1)
+            
+            # Combined Posterior Mean
+            theta_hat = (self.posterior_gamma_beta_ * theta_beta) + theta_discrete
+            
+            expected_failures = (1.0 - theta_hat[None, :]) ** k_matrix # (len_k, n_problems)
+            
+            pass_at_k = 1.0 - np.mean(expected_failures, axis=1)
+            self._psi = (1.0 - expected_failures).T
+
+        else:
+            raise ValueError(f"method must be 'integrated', 'posterior', or 'plugin', got {method!r}")
+
+        if pass_at_k.size == 1:
+            return float(pass_at_k[0])
+        return pass_at_k
+
+    def _check_fitted(self):
         if not hasattr(self, "w_"):
+            raise ValueError("Estimator not fitted. Call fit() first.")
+
+
+class DirichletProcessBetaPassAtK:
+    """
+    Estimate pass@k using a Truncated Dirichlet Process with a Beta Base Measure.
+    
+    Instead of a fixed grid, this model dynamically learns the locations (theta) 
+    and weights (pi) of K discrete clusters. The Beta base measure acts as a 
+    prior on the cluster locations, preventing zero-collapse by dragging the 
+    locations slightly away from exactly 0 or 1.
+    
+    Parameters
+    ----------
+    max_clusters : int, default=50
+        The truncation limit (K) for the Dirichlet Process.
+    dp_concentration : float, default=1.0
+        The gamma parameter of the DP. Higher values encourage more clusters.
+    max_iter : int, default=1000
+        Maximum EM iterations.
+    tol : float, default=1e-5
+        Convergence tolerance.
+    """
+    def __init__(self, max_clusters=50, dp_concentration=1.0, max_iter=1000, tol=1e-5):
+        self.max_clusters = max_clusters
+        self.dp_concentration = dp_concentration
+        self.max_iter = max_iter
+        self.tol = tol
+
+    def fit(self, successes, attempts):
+        self.n_problems_in_ = len(successes)
+        self.successes_ = np.asarray(successes, dtype=float)
+        self.attempts_ = np.asarray(attempts, dtype=float)
+        
+        y = self.successes_
+        n = self.attempts_
+        
+        # 1. Fit the Base Measure (Global Beta) using Method-of-Moments
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ph = np.where(n > 0, y / n, np.nan)
+        ph = ph[np.isfinite(ph)]
+        
+        def _mom_init(p_arr):
+            if p_arr.size < 2: return 1.0, 1.0
+            m, v = float(np.mean(p_arr)), float(np.var(p_arr, ddof=1))
+            m = np.clip(m, 1e-6, 1.0 - 1e-6)
+            vmax = m * (1.0 - m)
+            if not np.isfinite(v) or v <= 0 or v >= vmax: return 1.0, 1.0
+            t = vmax / v - 1.0
+            return max(m * t, 1.0), max((1.0 - m) * t, 1.0)
+
+        # Alpha_0 and Beta_0 are the Base Measure parameters
+        self.alpha_0_, self.beta_0_ = _mom_init(ph)
+        
+        # 2. Initialize DP Clusters
+        # Randomly draw initial cluster locations from the Base Measure
+        np.random.seed(42) # Optional: for reproducibility
+        self.theta_ = np.random.beta(self.alpha_0_, self.beta_0_, size=self.max_clusters)
+        self.pi_ = np.ones(self.max_clusters) / self.max_clusters
+        
+        prev_ll = -np.inf
+        
+        # 3. Expectation-Maximization Loop
+        for it in range(self.max_iter):
+            # Clip theta for numerical stability in log
+            t_safe = np.clip(self.theta_, 1e-10, 1.0 - 1e-10)
+            
+            # --- E-STEP ---
+            # Calculate log-likelihood of each problem under each cluster
+            # Shape: (N_problems, K_clusters)
+            log_L = (y[:, None] * np.log(t_safe)[None, :] + 
+                     (n - y)[:, None] * np.log(1.0 - t_safe)[None, :])
+            
+            log_joint = np.log(self.pi_ + 1e-15)[None, :] + log_L
+            
+            # Logsumexp to get marginals and responsibilities
+            log_marginal = logsumexp(log_joint, axis=1)
+            gamma = np.exp(log_joint - log_marginal[:, None]) # Shape: (N, K)
+            
+            current_ll = np.sum(log_marginal)
+            if np.abs(current_ll - prev_ll) < self.tol:
+                break
+            prev_ll = current_ll
+            
+            # --- M-STEP ---
+            # 1. Update Weights (pi) with Dirichlet Prior (DP Concentration)
+            expected_counts = np.sum(gamma, axis=0) # (K,)
+            smoothed_counts = expected_counts + (self.dp_concentration / self.max_clusters)
+            self.pi_ = smoothed_counts / np.sum(smoothed_counts)
+            
+            # 2. Update Locations (theta) with Beta Base Measure (Posterior Mean)
+            # This is where the magic happens: the Beta prior prevents theta from becoming exactly 0 or 1.
+            weighted_successes = np.sum(gamma * y[:, None], axis=0) # (K,)
+            weighted_attempts = np.sum(gamma * n[:, None], axis=0) # (K,)
+            
+            self.theta_ = (weighted_successes + self.alpha_0_) / (weighted_attempts + self.alpha_0_ + self.beta_0_)
+            
+        # Filter out "dead" clusters (weights near zero) to clean up the model
+        active = self.pi_ > 1e-4
+        self.pi_ = self.pi_[active] / np.sum(self.pi_[active])
+        self.theta_ = self.theta_[active]
+        self.n_support_ = len(self.theta_)
+        
+        # Calculate final posteriors for predictions
+        t_safe = np.clip(self.theta_, 1e-10, 1.0 - 1e-10)
+        log_L = y[:, None] * np.log(t_safe)[None, :] + (n - y)[:, None] * np.log(1.0 - t_safe)[None, :]
+        log_joint = np.log(self.pi_)[None, :] + log_L
+        self.posterior_weights_ = np.exp(log_joint - logsumexp(log_joint, axis=1)[:, None])
+
+        return self
+
+    def predict(self, k_values, method="integrated"):
+        self._check_fitted()
+        k_values = np.atleast_1d(k_values).astype(float)
+        
+        t_row = self.theta_[None, :]
+        k_matrix = k_values[:, None]
+        one_minus_t_pow = (1.0 - t_row) ** k_matrix # (len_k, n_support)
+        
+        if method == "integrated":
+            expected_failures = np.sum(self.pi_ * one_minus_t_pow, axis=1)
+            pass_at_k = 1.0 - expected_failures
+            self._psi = np.broadcast_to(pass_at_k, (self.n_problems_in_, len(k_values))).copy()
+            
+        elif method == "posterior":
+            expected_fail_per_problem = self.posterior_weights_ @ one_minus_t_pow.T
+            pass_at_k = 1.0 - np.mean(expected_fail_per_problem, axis=0)
+            self._psi = 1.0 - expected_fail_per_problem
+            
+        elif method == "plugin":
+            theta_hat = np.sum(self.posterior_weights_ * self.theta_[None, :], axis=1)
+            expected_failures = (1.0 - theta_hat[None, :]) ** k_matrix
+            pass_at_k = 1.0 - np.mean(expected_failures, axis=1)
+            self._psi = (1.0 - expected_failures).T
+            
+        else:
+            raise ValueError(f"method must be 'integrated', 'posterior', or 'plugin', got {method!r}")
+
+        if pass_at_k.size == 1:
+            return float(pass_at_k[0])
+        return pass_at_k
+
+    def _check_fitted(self):
+        if not hasattr(self, "pi_"):
+            raise ValueError("Estimator not fitted. Call fit() first.")
+
+
+
+
+class BetaSmoothedNPMLEPassAtK:
+    """
+    Beta-Smoothed NPMLE (Kernel Density Estimation).
+
+    This model achieves the mathematical ideal by taking the discrete structural 
+    grid of the Regularized NPMLE and "melting" every point mass into a continuous 
+    Beta kernel. 
+
+    - For problems with y > 0: The Bayesian update naturally tightens the Beta 
+      kernels around the empirical data, minimizing WRMSE at small k.
+    - For problems with y = 0: The Bayesian update naturally relies on the lowest 
+      Beta kernel (where alpha < 1). This natively triggers Karamata's Tauberian 
+      theorem, guaranteeing algebraic O(k^-alpha) decay for safe extrapolation 
+      without requiring any hardcoded splicing boundaries.
+
+    Parameters
+    ----------
+    nu : float, default=8.0
+        The precision parameter of the Beta kernels. Higher values make the kernels 
+        sharper (closer to raw NPMLE). Lower values apply heavier smoothing.
+    reg_alpha : float, default=0.001
+        The Dirichlet regularization applied to the underlying NPMLE.
+    m_grid : int, default=300
+        The number of grid points for the underlying NPMLE.
+    """
+    def __init__(self, nu=8.0, reg_alpha=0.001, m_grid=300, verbose=False):
+        self.nu = nu
+        self.reg_alpha = reg_alpha
+        self.m_grid = m_grid
+        self.verbose = verbose
+        # Internally instantiate the optimal baseline NPMLE
+        self.npmle = NPMLEBinomialPassAtK(
+            m_grid=m_grid, 
+            reg_alpha=reg_alpha, 
+            verbose=verbose
+        )
+
+    def fit(self, successes, attempts):
+        self.successes_ = np.asarray(successes, dtype=float)
+        self.attempts_ = np.asarray(attempts, dtype=float)
+        self.n_problems_in_ = len(self.successes_)
+
+        # 1. Fit the underlying NPMLE to get the structural modes
+        self.npmle.fit(self.successes_, self.attempts_)
+
+        # 2. Extract the grid points (t) and mixture weights (w)
+        self.w_ = self.npmle.w_
+        
+        # Clip t slightly away from absolute 0 or 1 to ensure valid Beta parameters
+        self.t_ = np.clip(self.npmle.t_, 1e-10, 1.0 - 1e-10)
+
+        # 3. Pre-calculate the Prior Beta parameters for each KDE kernel
+        # Mean of kernel j is t_j. Precision is nu.
+        self.alpha_prior_ = self.nu * self.t_
+        self.beta_prior_  = self.nu * (1.0 - self.t_)
+
+        return self
+
+    def predict(self, k_values, method="posterior"):
+        self._check_fitted()
+        k_values = np.atleast_1d(k_values).astype(float)
+
+        # Prior log-weights: shape (1, n_support)
+        log_w = np.log(self.w_ + 1e-15)[None, :]
+
+        # Data arrays: shape (n_problems, 1)
+        y = self.successes_[:, None]
+        n = self.attempts_[:, None]
+
+        # Prior parameter arrays: shape (1, n_support)
+        a = self.alpha_prior_[None, :]
+        b = self.beta_prior_[None, :]
+
+        if method == "integrated":
+            # Global Failure Rate: E[(1-theta)^k] under the prior mixture
+            # B(a, b+k) / B(a, b)
+            log_fail_prior = betaln(a, b + k_values[:, None]) - betaln(a, b)
+            expected_failures_per_kernel = np.exp(log_fail_prior)  # (len_k, n_support)
+
+            # Weighted sum over kernels
+            expected_failures = np.sum(self.w_[None, :] * expected_failures_per_kernel, axis=1)
+            
+            pass_at_k = 1.0 - expected_failures
+            self._psi = np.broadcast_to(pass_at_k, (self.n_problems_in_, len(k_values))).copy()
+
+        elif method in ["posterior", "plugin"]:
+            # --- Exact Bayesian Update for the Mixture ---
+            
+            # 1. Update the parameters of every kernel for every problem
+            a_post = a + y  # (n_problems, n_support)
+            b_post = b + n - y
+            
+            # 2. Compute Log Marginal Likelihood of the data under each kernel
+            # This determines which kernels best explain which problems
+            log_L = betaln(a_post, b_post) - betaln(a, b)
+            
+            # 3. Calculate Exact Posterior Mixture Weights (Responsibilities)
+            log_joint = log_w + log_L
+            log_marginal = logsumexp(log_joint, axis=1, keepdims=True)
+            gamma = np.exp(log_joint - log_marginal)  # (n_problems, n_support)
+
+            if method == "posterior":
+                # E[(1-theta)^k | data] = sum_j gamma_ij * [B(a_post, b_post + k) / B(a_post, b_post)]
+                
+                # Expand to 3D for broadcasting against k_values
+                a_post_3d = a_post[:, :, None]  # (n_problems, n_support, 1)
+                b_post_3d = b_post[:, :, None]
+                k_3d = k_values[None, None, :]  # (1, 1, len_k)
+
+                log_fail_post = betaln(a_post_3d, b_post_3d + k_3d) - betaln(a_post_3d, b_post_3d)
+                fail_post = np.exp(log_fail_post)  # (n_problems, n_support, len_k)
+
+                # Multiply by posterior responsibilities and sum over kernels
+                expected_fail_per_problem = np.sum(gamma[:, :, None] * fail_post, axis=1) 
+                
+                pass_at_k = 1.0 - np.mean(expected_fail_per_problem, axis=0)
+                self._psi = 1.0 - expected_fail_per_problem
+
+            elif method == "plugin":
+                # Posterior mean of each kernel
+                mean_kernel = a_post / (a_post + b_post)
+                
+                # Overall posterior mean for problem i
+                theta_hat = np.sum(gamma * mean_kernel, axis=1)  # (n_problems,)
+
+                expected_failures = (1.0 - theta_hat[None, :]) ** k_values[:, None]
+                
+                pass_at_k = 1.0 - np.mean(expected_failures, axis=1)
+                self._psi = (1.0 - expected_failures).T
+
+        else:
+            raise ValueError(f"method must be 'integrated', 'posterior', or 'plugin', got {method!r}")
+
+        if pass_at_k.size == 1:
+            return float(pass_at_k[0])
+        return pass_at_k
+
+    def _check_fitted(self):
+        if not hasattr(self, "w_"):
+            raise ValueError("Estimator not fitted. Call fit() first.")
+
+
+
+
+
+# class BetaSmoothedNPMLEPassAtK:
+#     """
+#     Beta-Smoothed NPMLE (Kernel Density Estimation) with Adaptive Bandwidths.
+
+#     This model achieves the mathematical ideal by taking the discrete structural 
+#     grid of the Regularized NPMLE and "melting" every point mass into a continuous 
+#     Beta kernel. 
+
+#     Upgrades:
+#     - nu="auto": Automatically scales global precision based on dataset size N, 
+#       preventing over-smoothing on dense datasets (GPQA) while heavily smoothing 
+#       sparse datasets (AIME).
+#     - adaptive_bandwidth: Localizes precision across the grid. Kernels in the 
+#       noisy center widen to smooth variance, while edge kernels sharpen to 
+#       guarantee extreme-value tail asymptotics.
+
+#     Parameters
+#     ----------
+#     nu : float or "auto", default="auto"
+#         The base precision parameter of the Beta kernels. If "auto", it dynamically
+#         calculates precision based on the number of observed problems (sqrt(N)).
+#     adaptive_bandwidth : bool, default=True
+#         Whether to scale precision locally based on grid variance t(1-t).
+#     reg_alpha : float, default=0.001
+#         The Dirichlet regularization applied to the underlying NPMLE.
+#     m_grid : int, default=300
+#         The number of grid points for the underlying NPMLE.
+#     """
+#     def __init__(self, nu="auto", adaptive_bandwidth=True, reg_alpha=0.001, m_grid=300, verbose=False):
+#         self.nu = nu
+#         self.adaptive_bandwidth = adaptive_bandwidth
+#         self.reg_alpha = reg_alpha
+#         self.m_grid = m_grid
+#         self.verbose = verbose
+#         # Internally instantiate the optimal baseline NPMLE
+#         self.npmle = NPMLEBinomialPassAtK(
+#             m_grid=m_grid, 
+#             reg_alpha=reg_alpha, 
+#             verbose=verbose
+#         )
+
+#     def fit(self, successes, attempts):
+#         self.successes_ = np.asarray(successes, dtype=float)
+#         self.attempts_ = np.asarray(attempts, dtype=float)
+#         self.n_problems_in_ = len(self.successes_)
+
+#         # 1. Fit the underlying NPMLE to get the structural modes
+#         self.npmle.fit(self.successes_, self.attempts_)
+
+#         # 2. Extract the grid points (t) and mixture weights (w)
+#         self.w_ = self.npmle.w_
+        
+#         # Clip t slightly away from absolute 0 or 1 to ensure valid Beta parameters
+#         self.t_ = np.clip(self.npmle.t_, 1e-10, 1.0 - 1e-10)
+
+#         # 3. Calculate Base Precision
+#         if self.nu == "auto":
+#             # KDE precision should grow as N grows to prevent over-smoothing dense data.
+#             # O(sqrt(N)) is a highly stable heuristic for Beta KDE bandwidths.
+#             base_nu = float(np.sqrt(self.n_problems_in_))
+#         else:
+#             base_nu = float(self.nu)
+
+#         # 4. Calculate Final Adaptive Precision per Kernel
+#         if self.adaptive_bandwidth:
+#             # Deterministic variance scaling: precision = base_nu / (variance + epsilon)
+#             # Epsilon = 0.1 prevents infinite precision (Dirac collapse) exactly at 0 or 1,
+#             # guaranteeing that the lowest kernel maintains alpha < 1.
+#             epsilon = 0.1
+#             self.nu_j_ = base_nu / (self.t_ * (1.0 - self.t_) + epsilon)
+#         else:
+#             self.nu_j_ = np.full_like(self.t_, base_nu)
+
+#         # 5. Pre-calculate the Prior Beta parameters for each KDE kernel
+#         self.alpha_prior_ = self.nu_j_ * self.t_
+#         self.beta_prior_  = self.nu_j_ * (1.0 - self.t_)
+
+#         return self
+
+#     def predict(self, k_values, method="posterior"):
+#         self._check_fitted()
+#         k_values = np.atleast_1d(k_values).astype(float)
+
+#         # Prior log-weights: shape (1, n_support)
+#         log_w = np.log(self.w_ + 1e-15)[None, :]
+
+#         # Data arrays: shape (n_problems, 1)
+#         y = self.successes_[:, None]
+#         n = self.attempts_[:, None]
+
+#         # Prior parameter arrays: shape (1, n_support)
+#         # Broadcasting works perfectly with adaptive bandwidths since it's an array
+#         a = self.alpha_prior_[None, :]
+#         b = self.beta_prior_[None, :]
+
+#         if method == "integrated":
+#             # Global Failure Rate: E[(1-theta)^k] under the prior mixture
+#             log_fail_prior = betaln(a, b + k_values[:, None]) - betaln(a, b)
+#             expected_failures_per_kernel = np.exp(log_fail_prior)  # (len_k, n_support)
+
+#             # Weighted sum over kernels
+#             expected_failures = np.sum(self.w_[None, :] * expected_failures_per_kernel, axis=1)
+            
+#             pass_at_k = 1.0 - expected_failures
+#             self._psi = np.broadcast_to(pass_at_k, (self.n_problems_in_, len(k_values))).copy()
+
+#         elif method in ["posterior", "plugin"]:
+#             # --- Exact Bayesian Update for the Mixture ---
+            
+#             # 1. Update the parameters of every kernel for every problem
+#             a_post = a + y  # (n_problems, n_support)
+#             b_post = b + n - y
+            
+#             # 2. Compute Log Marginal Likelihood of the data under each kernel
+#             log_L = betaln(a_post, b_post) - betaln(a, b)
+            
+#             # 3. Calculate Exact Posterior Mixture Weights (Responsibilities)
+#             log_joint = log_w + log_L
+#             log_marginal = logsumexp(log_joint, axis=1, keepdims=True)
+#             gamma = np.exp(log_joint - log_marginal)  # (n_problems, n_support)
+
+#             if method == "posterior":
+#                 # Expand to 3D for broadcasting against k_values
+#                 a_post_3d = a_post[:, :, None]  # (n_problems, n_support, 1)
+#                 b_post_3d = b_post[:, :, None]
+#                 k_3d = k_values[None, None, :]  # (1, 1, len_k)
+
+#                 log_fail_post = betaln(a_post_3d, b_post_3d + k_3d) - betaln(a_post_3d, b_post_3d)
+#                 fail_post = np.exp(log_fail_post)  # (n_problems, n_support, len_k)
+
+#                 # Multiply by posterior responsibilities and sum over kernels
+#                 expected_fail_per_problem = np.sum(gamma[:, :, None] * fail_post, axis=1) 
+                
+#                 pass_at_k = 1.0 - np.mean(expected_fail_per_problem, axis=0)
+#                 self._psi = 1.0 - expected_fail_per_problem
+
+#             elif method == "plugin":
+#                 mean_kernel = a_post / (a_post + b_post)
+#                 theta_hat = np.sum(gamma * mean_kernel, axis=1)  # (n_problems,)
+#                 expected_failures = (1.0 - theta_hat[None, :]) ** k_values[:, None]
+                
+#                 pass_at_k = 1.0 - np.mean(expected_failures, axis=1)
+#                 self._psi = (1.0 - expected_failures).T
+
+#         else:
+#             raise ValueError(f"method must be 'integrated', 'posterior', or 'plugin', got {method!r}")
+
+#         if pass_at_k.size == 1:
+#             return float(pass_at_k[0])
+#         return pass_at_k
+
+#     def _check_fitted(self):
+#         if not hasattr(self, "w_"):
+#             raise ValueError("Estimator not fitted. Call fit() first.")
+
+
+
+class CrossFittedBetaBinomialPassAtK:
+    """
+    Leave-One-Out Cross-Fitted Beta-Binomial Estimator.
+
+    Instead of fitting a single global prior and using it to predict all problems,
+    this estimator fits a Beta(alpha, beta) prior on N-1 problems, and uses that
+    isolated prior to compute the posterior prediction for the single left-out problem.
+    It repeats this for all N problems and averages the results.
+
+    This prevents "double-dipping" (using the same data to shape the prior and 
+    update the posterior), significantly reducing overfitting at small sample sizes.
+    """
+
+    def __init__(self, verbose=False):
+        self.verbose = verbose
+
+    def _fit_mle(self, successes, attempts, warm_start=None):
+        """Helper method to fit the Beta-Binomial MLE on a subset of data."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            p_hat = np.where(attempts > 0, successes / attempts, np.nan)
+        p_hat = p_hat[np.isfinite(p_hat)]
+
+        def _mom_init(ph):
+            if ph.size < 2: return 1.0, 1.0
+            m = float(np.mean(ph))
+            v = float(np.var(ph, ddof=1))
+            m = min(max(m, 1e-6), 1.0 - 1e-6)
+            vmax = m * (1.0 - m)
+            if not np.isfinite(v) or v <= 0 or v >= vmax: return 1.0, 1.0
+            t = vmax / v - 1.0
+            a = max(m * t, 1e-5)
+            b = max((1.0 - m) * t, 1e-5)
+            return a, b
+
+        a0_mom, b0_mom = _mom_init(p_hat)
+
+        def nll_log_params(log_params):
+            alpha = np.exp(log_params[0])
+            beta = np.exp(log_params[1])
+            log_lik = betaln(successes + alpha, attempts - successes + beta) - betaln(alpha, beta)
+            return -np.sum(log_lik)
+
+        # Use warm start if available to drastically speed up the N LOO iterations
+        inits = [(np.log(a0_mom), np.log(b0_mom))]
+        if warm_start is not None:
+            inits.insert(0, (np.log(warm_start[0]), np.log(warm_start[1])))
+        else:
+            inits.append((np.log(1.0), np.log(1.0)))
+
+        best = None
+        for x0 in inits:
+            res = minimize(nll_log_params, x0, method="L-BFGS-B")
+            if best is None or res.fun < best.fun:
+                best = res
+
+        return float(np.exp(best.x[0])), float(np.exp(best.x[1]))
+
+    def fit(self, successes, attempts):
+        """
+        Fit the N cross-fitted priors.
+        """
+        self.successes_ = np.asarray(successes, dtype=float)
+        self.attempts_ = np.asarray(attempts, dtype=float)
+        n = len(self.successes_)
+        
+        if n < 2:
+            raise ValueError("Need at least 2 problems for cross-fitting.")
+
+        # 1. Fit global MLE to use as a warm start for the LOO fits
+        global_alpha, global_beta = self._fit_mle(self.successes_, self.attempts_)
+
+        self.loo_alphas_ = np.zeros(n)
+        self.loo_betas_ = np.zeros(n)
+
+        # 2. Leave-One-Out Cross-Fitting Loop
+        for i in range(n):
+            # Create a mask that is True everywhere except index i
+            mask = np.ones(n, dtype=bool)
+            mask[i] = False
+            
+            loo_succ = self.successes_[mask]
+            loo_att = self.attempts_[mask]
+            
+            # Fit MLE on N-1 problems
+            a_i, b_i = self._fit_mle(loo_succ, loo_att, warm_start=(global_alpha, global_beta))
+            
+            self.loo_alphas_[i] = a_i
+            self.loo_betas_[i] = b_i
+            
+        return self
+
+    def predict(self, k_values):
+        """
+        Predict pass@k by applying the cross-fitted priors to their respective 
+        left-out problems, then averaging the posteriors.
+        """
+        self._check_fitted()
+        k_values = np.atleast_1d(k_values).astype(float)
+
+        # 1. Compute posterior Beta parameters for each problem using its isolated LOO prior
+        post_alpha = self.loo_alphas_ + self.successes_
+        post_beta = self.loo_betas_ + self.attempts_ - self.successes_
+        
+        # 2. Expand dimensions for broadcasting (Num_Problems x Num_K_Values)
+        pa = post_alpha[:, None]
+        pb = post_beta[:, None]
+        k_val = k_values[None, :]
+        
+        # 3. Compute the expected value of (1-theta)^k under each local posterior
+        # E[(1-theta)^k] = B(alpha, beta + k) / B(alpha, beta)
+        log_prob_fail = betaln(pa, pb + k_val) - betaln(pa, pb)
+        expected_fail_per_problem = np.exp(log_prob_fail)
+
+        # Average the expected failures across all cross-fitted problems
+        pass_at_k = 1.0 - expected_fail_per_problem.mean(axis=0)
+
+        if pass_at_k.size == 1:
+            return float(pass_at_k[0])
+        return pass_at_k
+
+    def _check_fitted(self):
+        if not hasattr(self, "loo_alphas_"):
             raise ValueError("Estimator not fitted. Call fit() first.")
